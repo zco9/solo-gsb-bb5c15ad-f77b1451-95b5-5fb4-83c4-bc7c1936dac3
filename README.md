@@ -9,6 +9,14 @@
 - `POST /assemble`：回显 `/plan` 的 `blocks`、`mappings`（以及 `cached_blocks`），
   并分别按块提供 Base64 回源内容与缓存内容；服务严格校验来源 id、边界、缺块
   与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64 内容与长度。
+- `POST /verify-fetch-batch`：在 `/plan` 与 `/assemble` 之间校验**一批上游 206
+  回源结果**。接收 `/plan` 的 `blocks`、`object_length`，以及按块编号提供的
+  上游状态码、`Content-Range`、`ETag` 与 Base64 响应体（可选 `expected_etag`）。
+  只接受与规划闭区间及对象总长一致的 `206`，逐块核对响应体字节数、缺块与重复块；
+  所有块必须携带**同一个强 ETag**（缺失、弱标签 `W/`、不同版本均拒绝），提供
+  `expected_etag` 时还须逐字节一致。通过后按块编号返回可直接用于
+  `/assemble` 的 `contents` 数据与确认的 ETag；失败返回带块编号与原因的 `422`，
+  且错误响应**不回显响应体**。
 - `POST /multipart-parse`：解析上游对多区间 Range 请求返回的
   `multipart/byteranges` **完整响应体**（Base64 传输）。严格按 CRLF 切分每个
   part，校验 `Content-Range` 闭区间、part 字节长度、对象总长度/边界、
@@ -25,6 +33,47 @@
   `filename*`（支持 UTF-8 / ISO-8859-1 百分号编码），无效或缺失时回退到传统
   `filename`；解码后剥离路径前缀（`/` 与 `\`）、控制字符及尾部点/空格，空名与
   `.` / `..` 等危险名称一律拒绝，无法得到有效名称时返回 `422`。
+
+## 快速开始
+
+单条命令构建并后台启动（需 Docker 20.10+，支持 Compose v2，在仓库根目录执行）：
+
+```
+docker compose up --build -d
+```
+
+服务访问地址：
+
+- 健康检查：http://127.0.0.1:8080/healthz
+- 接口根地址：`http://127.0.0.1:8080`（Swagger 交互文档：http://127.0.0.1:8080/docs ）
+- `/plan`、`/assemble`、`/multipart-parse`、`/verify-fetch-batch`、
+  `/safe-download-name` 均无需鉴权；`/secure-request` 需配置密钥（见下文）。
+
+最小接口示例（先规划、再校验回源、最后重组）：
+
+```bash
+# 1) 规划：对象 256 字节，取前 40 字节，单次回源上限 128
+curl -s -X POST http://127.0.0.1:8080/plan \
+  -H 'Content-Type: application/json' \
+  -d '{"object_length":256,"ranges":[{"type":"interval","start":0,"end":39}],
+       "max_gap":8,"fetch_limit":128}'
+
+# 2) 校验回源块（状态码 206、Content-Range、强 ETag、响应体字节数）
+curl -s -X POST http://127.0.0.1:8080/verify-fetch-batch \
+  -H 'Content-Type: application/json' \
+  -d '{"object_length":256,
+       "blocks":[{"index":0,"start":0,"end":39,"length":40,"range_header":"bytes=0-39"}],
+       "responses":[{"block_index":0,"status_code":206,
+         "content_range":"bytes 0-39/256","etag":"\"v1\"",
+         "body_b64":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJw=="}]}'
+
+# 3) 解析下载文件名（无需鉴权）
+curl -s -X POST http://127.0.0.1:8080/safe-download-name \
+  -H 'Content-Type: application/json' \
+  -d '{"content_disposition":"attachment; filename=\"report-2026.bin\""}'
+```
+
+停止服务：`docker compose down`；查看日志：`docker compose logs -f`。
 
 ## Docker 一键启动
 
@@ -252,6 +301,113 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 `cached_blocks` 的字节并做 Base64 编码；最后连同 `blocks`、`mappings`、
 `cached_blocks` 一起提交给 `/assemble`，即可取回与原请求 ranges 一一对应
 的字节内容。
+
+### `POST /verify-fetch-batch`
+
+在发起实际回源之后、调用 `/assemble` 之前，用本端点集中校验上游结果是否与
+`/plan` 的规划严格一致，并确认对象版本（强 ETag）。请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_length` | 对象总字节长度，原样回显 `/plan` 的值 |
+| `blocks` | 原样回显 `/plan` 返回的 `blocks`（全部命中缓存、无回源块时为 `[]`） |
+| `responses` | 按块编号提供的上游结果列表，每项含 `block_index`、`status_code`、`content_range`、`etag`、`body_b64`，须与 `blocks` 一一对应 |
+| `expected_etag` | 可选；调用方已知的强 ETag，提供时各块 ETag 必须与之逐字节一致（首尾空白会被去除） |
+
+其中每个回源结果项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `block_index` | 对应 `blocks[].index` 的回源块编号 |
+| `status_code` | 上游响应状态码（整数），**仅接受 `206`**（`200`/`416` 等一律拒绝） |
+| `content_range` | 上游 `Content-Range` 头原始值，须严格为 `bytes <start>-<end>/<total>`（不接受 `*` 与 unsatisfied-range），闭区间与 `total` 必须与规划一致 |
+| `etag` | 上游 `ETag` 头原始值，必须是**强验证器**：`"<opaque-tag>"` 形式，不得以 `W/` 开头；所有块必须完全相同 |
+| `body_b64` | 该块完整响应体的标准 Base64（含 `=` 填充），解码字节数必须等于块的 `length` |
+
+请求示例（沿用本文 `/plan` 的 256 字节示例，规划出 `[0,39]`、`[60,99]`、
+`[240,255]` 三个回源块；此处只展示一个块的完整结构）：
+
+```json
+{
+  "object_length": 256,
+  "blocks": [
+    {"index": 0, "start": 0, "end": 39, "length": 40, "range_header": "bytes=0-39"},
+    {"index": 1, "start": 60, "end": 99, "length": 40, "range_header": "bytes=60-99"},
+    {"index": 2, "start": 240, "end": 255, "length": 16, "range_header": "bytes=240-255"}
+  ],
+  "expected_etag": "\"v1\"",
+  "responses": [
+    {
+      "block_index": 0,
+      "status_code": 206,
+      "content_range": "bytes 0-39/256",
+      "etag": "\"v1\"",
+      "body_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJw=="
+    },
+    {
+      "block_index": 1,
+      "status_code": 206,
+      "content_range": "bytes 60-99/256",
+      "etag": "\"v1\"",
+      "body_b64": "PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw=="
+    },
+    {
+      "block_index": 2,
+      "status_code": 206,
+      "content_range": "bytes 240-255/256",
+      "etag": "\"v1\"",
+      "body_b64": "8PHy8/T19vf4+fr7/P3+/w=="
+    }
+  ]
+}
+```
+
+成功时（HTTP 200）返回确认的强 ETag 与按 `block_index` 升序排列的块内容，
+`contents` **可原样放入 `/assemble` 请求的 `contents` 字段**：
+
+```json
+{
+  "object_length": 256,
+  "etag": "\"v1\"",
+  "contents": [
+    {"block_index": 0, "data_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJw=="},
+    {"block_index": 1, "data_b64": "PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw=="},
+    {"block_index": 2, "data_b64": "8PHy8/T19vf4+fr7/P3+/w=="}
+  ]
+}
+```
+
+`blocks` 为空（全部命中缓存、无需回源）时请求同样合法，返回
+`{"object_length": ..., "etag": null, "contents": []}`；此时即便提供了
+`expected_etag` 也没有上游 ETag 可比较。
+
+#### 校验规则（任一不满足都返回 `422`）
+
+1. `blocks[].index` 唯一、区间合法、`length == end - start + 1` 且
+   `end < object_length`（与 `/assemble` 对 blocks 的校验一致）；
+2. `responses[].block_index` 唯一且与 `blocks` 一一对应：缺块
+   （`missing_block_response`）、重复提供（`duplicate_block_response`）、
+   提供规划之外的块（`unexpected_block_response`）均拒绝；
+3. 每块 `status_code` 必须严格等于 `206`（`unexpected_status`）；
+4. `content_range` 必须匹配 `bytes <start>-<end>/<total>`
+   （`invalid_content_range`），`total == object_length`
+   （`object_length_mismatch`），闭区间必须与该块的规划区间逐字节相等
+   （`content_range_mismatch`，起始或结束偏移差一也会拒绝）；
+5. `etag` 去首尾空白后必须是合法强验证器（`weak_or_invalid_etag`）：拒绝
+   `W/"..."` / `w/"..."` 弱标签、缺少双引号、内部含双引号/控制字符/空格等
+   非法语法；各块 ETag 必须完全相同（强比较，`etag_mismatch`），防止不同
+   对象版本的响应混入同一批次；
+6. `body_b64` 必须是含正确填充的标准 Base64（`invalid_base64`），解码字节数
+   必须恰好等于该块规划长度（`block_length_mismatch`）；
+7. `expected_etag` 自身必须是合法强验证器（`invalid_expected_etag`），且存在
+   回源块时必须与各块共同确认的 ETag 逐字节一致（`expected_etag_mismatch`）。
+
+错误响应统一为
+`{"error": "<code>", "detail": [{"message": ..., "loc": ..., "block_index": ...}]}`，
+`loc` 精确定位到字段（如 `responses[2].content_range`）。**所有错误响应都不
+回显请求中的响应体 / Base64 数据**，避免将上游字节原样反射回调用方。典型
+调用流程：`/plan` → 按 `range_header` 回源 → `/verify-fetch-batch` 校验并确认
+ETag → 把返回的 `contents` 连同 `blocks`、`mappings` 提交给 `/assemble`。
 
 ### `POST /multipart-parse`
 
@@ -607,6 +763,28 @@ quoted-string、disposition type 缺失等）返回
   | `block_out_of_bounds`       | 回源块超出对象长度                 |
   | `duplicate_mapping_index`   | mappings 中下标重复                |
   | `invalid_mapping_index`     | mappings 下标未覆盖 0..N-1         |
+
+- `/verify-fetch-batch` 的回源校验错误同样为
+  `{"error": "<code>", "detail": [{"message": ..., "loc": ..., "block_index": ...}]}`，
+  `loc` 指向出错字段（如 `responses[1].content_range`、`expected_etag`），
+  且任何错误都**不回显 `body_b64` 响应体**。错误码：
+
+  | error | 含义 |
+  | --- | --- |
+  | `invalid_block` / `block_out_of_bounds` / `duplicate_block` | 回显的 blocks 区间非法、越界或编号重复 |
+  | `missing_block_response` | 缺少某个规划块的上游结果（附全部缺失编号） |
+  | `duplicate_block_response` | 同一块的上游结果被重复提供 |
+  | `unexpected_block_response` | 提供了 blocks 中不存在的块结果 |
+  | `unexpected_status` | 上游状态码不是 206 |
+  | `invalid_content_range` | Content-Range 不符合 `bytes start-end/total` 格式 |
+  | `object_length_mismatch` | Content-Range 的 total 与 object_length 不符 |
+  | `content_range_mismatch` | Content-Range 闭区间与规划块区间不一致 |
+  | `weak_or_invalid_etag` | ETag 缺失、语法非法或为 `W/` 弱验证器 |
+  | `etag_mismatch` | 各块的强 ETag 不一致（对象版本混杂） |
+  | `invalid_base64` | body_b64 非法 Base64 或填充错误 |
+  | `block_length_mismatch` | 响应体解码字节数与规划块长度不符 |
+  | `invalid_expected_etag` | expected_etag 自身不是合法强验证器 |
+  | `expected_etag_mismatch` | 确认的 ETag 与 expected_etag 不一致 |
 
 `/secure-request` 的鉴权类错误（均为 `{"error": ..., "message": ...}`）：
 
