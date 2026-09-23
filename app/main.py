@@ -13,6 +13,15 @@ POST /assemble 回显 /plan 的 blocks、mappings（以及 cached_blocks），�
 与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64
 内容与长度。
 
+POST /verify-fetch-batch 校验按 /plan 的 blocks 逐块回源得到的上游
+206 响应：接收 /plan 返回的 blocks、object_length，以及按块编号提供的
+上游状态码、Content-Range、ETag 与 Base64 响应体。只接受状态码为 206、
+Content-Range 闭区间与规划块及对象总长完全一致、响应体字节数严格相符的
+块；缺块、重复块、多余块一律拒绝。所有块必须携带同一个强 ETag（拒绝弱
+标签与缺失标签），传入 expected_etag 时还必须与之全等，防止不同版本的
+响应混入。通过时按块编号返回可直接提交给 /assemble 的 contents 与确认的
+ETag；任何校验失败均返回带块编号与原因的 422，且不回显响应体。
+
 POST /secure-request 是 /plan 与 /assemble 的统一鉴权入口：请求携带
 operation（plan 或 assemble）、payload（即原接口请求体）、key_id、
 timestamp、nonce、signature；服务按固定 JSON 规范化后用环境配置的
@@ -279,6 +288,62 @@ class AssembleResponse(BaseModel):
     )
 
 
+# ---------------- /verify-fetch-batch 请求/响应模型 ----------------
+
+
+class UpstreamBlockResponse(BaseModel):
+    """单个回源块的上游响应要素（按块编号提供）。"""
+
+    block_index: int = Field(..., description="回源块编号，对应 blocks[].index")
+    status_code: Annotated[int, StrictInt] = Field(
+        ..., ge=100, le=599, description="上游 HTTP 状态码（仅 206 可通过校验）"
+    )
+    content_range: str = Field(
+        ...,
+        min_length=1,
+        description="上游 Content-Range 头原值，形如 'bytes start-end/total'",
+    )
+    etag: str | None = Field(
+        None,
+        description="上游 ETag 头原值；必须存在且为强 ETag（不得以 W/ 开头）",
+    )
+    body_b64: str = Field(..., description="该块上游响应体的标准 Base64")
+
+
+class VerifyFetchBatchRequest(BaseModel):
+    object_length: Annotated[int, StrictInt] = Field(..., ge=0, description="对象总字节长度")
+    blocks: list[FetchBlock] = Field(
+        ..., description="回显 /plan 返回的 blocks（全部命中缓存时为空列表）"
+    )
+    responses: list[UpstreamBlockResponse] = Field(
+        ..., description="按块编号提供的各回源块上游响应要素"
+    )
+    expected_etag: str | None = Field(
+        None,
+        description="可选：调用方先前确认过的强 ETag；提供时所有块必须与之全等",
+    )
+
+
+class VerifiedBlockContent(BaseModel):
+    """校验通过的单块内容：字段与 /assemble 的 contents 元素完全一致。"""
+
+    block_index: int = Field(..., description="回源块编号，对应 blocks[].index")
+    data_b64: str = Field(..., description="该回源块的完整回源内容（标准 Base64）")
+
+
+class VerifyFetchBatchResponse(BaseModel):
+    object_length: int
+    contents: list[VerifiedBlockContent] = Field(
+        ...,
+        description="按块编号升序排列，可直接作为 /assemble 的 contents 提交",
+    )
+    etag: str | None = Field(
+        ...,
+        description="所有块一致携带的强 ETag（去首尾 OWS 后的原值，含引号）；"
+        "blocks 为空时为 null",
+    )
+
+
 # ------------------- /multipart-parse 请求/响应模型 -------------------
 
 
@@ -493,6 +558,47 @@ async def multipart_parse_error_handler(request: Request, exc: MultipartParseErr
         detail["start"] = exc.start
     if exc.end is not None:
         detail["end"] = exc.end
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "detail": [detail]},
+    )
+
+
+class BatchVerifyError(Exception):
+    """回源批次校验失败（非 206、范围/长度不符、ETag 不一致、缺块等），HTTP 422。
+
+    loc 为可定位的字段路径，例如 "responses[2].content_range"、
+    "expected_etag"；block_index 在可归属到某个回源块时给出；
+    extra 用于附带补充字段（如 missing 块编号列表）。错误响应绝不回显
+    任何响应体字节或 Base64。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        loc: str | None = None,
+        *,
+        block_index: int | None = None,
+        code: str = "fetch_batch_error",
+        extra: dict[str, object] | None = None,
+    ):
+        self.message = message
+        self.loc = loc
+        self.block_index = block_index
+        self.code = code
+        self.extra = extra
+        super().__init__(message)
+
+
+@app.exception_handler(BatchVerifyError)
+async def batch_verify_error_handler(request: Request, exc: BatchVerifyError):
+    detail: dict[str, object] = {"message": exc.message}
+    if exc.loc is not None:
+        detail["loc"] = exc.loc
+    if exc.block_index is not None:
+        detail["block_index"] = exc.block_index
+    if exc.extra:
+        detail.update(exc.extra)
     return JSONResponse(
         status_code=422,
         content={"error": exc.code, "detail": [detail]},
@@ -1212,6 +1318,302 @@ def assemble(req: AssembleRequest) -> AssembleResponse:
         )
 
     return AssembleResponse(object_length=req.object_length, ranges=results)
+
+
+# --------------------------- /verify-fetch-batch ---------------------------
+
+# RFC 9110 opaque-tag：DQUOTE *etagc DQUOTE。etagc 为 0x21 / 0x23-0x7E /
+# obs-text(0x80-0xFF)——不含空格、控制字符与双引号本身；反斜杠在 ETag 中
+# 没有转义语义，0x5C 作为普通字面字符允许。
+_STRONG_ETAG_RE = re.compile(r'^"[\x21\x23-\x7e\x80-\xff]*"$')
+
+
+def _parse_strong_etag(
+    raw: str | None,
+    loc: str,
+    *,
+    block_index: int | None = None,
+    expected: bool = False,
+) -> str:
+    """校验并归一化强 ETag，返回去首尾 OWS 后的 opaque-tag 原值。
+
+    缺失/空白、弱标签（W/ 前缀，大小写不敏感）与非法 opaque-tag 一律拒绝；
+    expected=True 时使用 expected_etag 专属错误码。
+    """
+    if raw is None or not raw.strip(" \t"):
+        raise BatchVerifyError(
+            "缺少 ETag 响应头，无法确认回源块版本",
+            loc,
+            block_index=block_index,
+            code="missing_etag",
+        )
+    value = raw.strip(" \t")
+    if value[:2].lower() == "w/":
+        if expected:
+            raise BatchVerifyError(
+                "expected_etag 不允许是弱 ETag（W/ 前缀）：弱验证器不能保证"
+                "字节级一致",
+                loc,
+                code="weak_expected_etag",
+            )
+        raise BatchVerifyError(
+            "仅接受强 ETag：弱 ETag（W/ 前缀）不能保证字节级一致，"
+            "不得与其他块混合重组",
+            loc,
+            block_index=block_index,
+            code="weak_etag",
+        )
+    if not _STRONG_ETAG_RE.fullmatch(value):
+        if expected:
+            raise BatchVerifyError(
+                "expected_etag 不是合法的强 ETag：必须为双引号包裹的 "
+                "opaque-tag（如 \"v1\"），且不得为弱标签",
+                loc,
+                code="invalid_expected_etag",
+            )
+        raise BatchVerifyError(
+            "ETag 不是合法的强 ETag：必须为双引号包裹的 opaque-tag（如 "
+            '"v1"），不得包含空格、控制字符或裸引号',
+            loc,
+            block_index=block_index,
+            code="invalid_etag",
+        )
+    return value
+
+
+def _decode_b64_batch(raw: str, loc: str, block_index: int) -> bytes:
+    """严格按标准 Base64（含正确填充、validate=True）解码单块上游响应体。"""
+    if len(raw) % 4 != 0:
+        raise BatchVerifyError(
+            "Base64 长度不是 4 的倍数，缺少填充或包含非法字符",
+            loc,
+            block_index=block_index,
+            code="invalid_base64",
+        )
+    try:
+        return base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise BatchVerifyError(
+            f"Base64 解码失败：{exc}",
+            loc,
+            block_index=block_index,
+            code="invalid_base64",
+        )
+
+
+@app.post("/verify-fetch-batch", response_model=VerifyFetchBatchResponse)
+def verify_fetch_batch(req: VerifyFetchBatchRequest) -> VerifyFetchBatchResponse:
+    """逐块校验上游 206 响应与 /plan 规划的一致性及强 ETag 版本一致性。
+
+    通过时按块编号升序返回可直接用于 /assemble.contents 的数据与全批确认的
+    强 ETag；任何失败都抛出带块编号与原因的 BatchVerifyError（422），
+    错误响应中不包含任何响应体字节或 Base64。
+    """
+    # 0. expected_etag 先做独立的强 ETag 语法校验（与具体块无关）。
+    expected_etag: str | None = None
+    if req.expected_etag is not None:
+        expected_etag = _parse_strong_etag(
+            req.expected_etag, "expected_etag", expected=True
+        )
+
+    # 1. 校验回显的 blocks 自身：编号唯一、区间合法、length 自洽且不越界。
+    declared: dict[int, FetchBlock] = {}
+    for pos, block in enumerate(req.blocks):
+        if block.index < 0:
+            raise BatchVerifyError(
+                "回源块编号不得为负",
+                f"blocks[{pos}].index",
+                block_index=block.index,
+                code="invalid_block_index",
+            )
+        if block.end < block.start:
+            raise BatchVerifyError(
+                f"回源块 [{block.start},{block.end}] 非法：end 不得小于 start",
+                f"blocks[{pos}]",
+                block_index=block.index,
+                code="invalid_block",
+            )
+        if block.end >= req.object_length:
+            raise BatchVerifyError(
+                f"回源块 [{block.start},{block.end}] 越界："
+                f"对象长度为 {req.object_length}",
+                f"blocks[{pos}]",
+                block_index=block.index,
+                code="block_out_of_bounds",
+            )
+        if block.length != block.end - block.start + 1:
+            raise BatchVerifyError(
+                f"声明长度 {block.length} 与区间 [{block.start},{block.end}] "
+                f"应有的 {block.end - block.start + 1} 字节不符",
+                f"blocks[{pos}].length",
+                block_index=block.index,
+                code="invalid_block_length",
+            )
+        if block.index in declared:
+            raise BatchVerifyError(
+                f"回源块编号 {block.index} 在 blocks 中重复",
+                f"blocks[{pos}].index",
+                block_index=block.index,
+                code="duplicate_block",
+            )
+        declared[block.index] = block
+
+    # 2. 按 responses 输入顺序逐块校验上游响应要素。
+    items_by_index: dict[int, UpstreamBlockResponse] = {}
+    confirmed_etag: str | None = None
+    for pos, item in enumerate(req.responses):
+        loc_base = f"responses[{pos}]"
+        if item.block_index < 0:
+            raise BatchVerifyError(
+                "响应块编号不得为负",
+                f"{loc_base}.block_index",
+                block_index=item.block_index,
+                code="invalid_block_index",
+            )
+        if item.block_index in items_by_index:
+            raise BatchVerifyError(
+                f"回源块 {item.block_index} 的上游响应被重复提供",
+                f"{loc_base}.block_index",
+                block_index=item.block_index,
+                code="duplicate_response",
+            )
+        block = declared.get(item.block_index)
+        if block is None:
+            raise BatchVerifyError(
+                f"提供了 blocks 中不存在的多余回源块 {item.block_index} 的响应",
+                f"{loc_base}.block_index",
+                block_index=item.block_index,
+                code="unexpected_block",
+            )
+
+        # 2a. 仅接受 206 Partial Content：200/416 等一律拒绝，防止整对象
+        #     或错误响应被当作分块内容混入。
+        if item.status_code != 206:
+            raise BatchVerifyError(
+                f"回源块 {block.index} 的上游状态码为 {item.status_code}，"
+                "仅接受 206 Partial Content",
+                f"{loc_base}.status_code",
+                block_index=block.index,
+                code="non_206_status",
+            )
+
+        # 2b. Content-Range 必须严格为 bytes start-end/total，且闭区间与
+        #     规划块、total 与对象总长完全一致。
+        cr_value = item.content_range.strip(" \t")
+        try:
+            cr_match = _CONTENT_RANGE_RE.fullmatch(cr_value.encode("ascii"))
+        except UnicodeEncodeError:
+            cr_match = None
+        if cr_match is None:
+            raise BatchVerifyError(
+                "Content-Range 不符合 'bytes start-end/total' 格式"
+                "（不接受 * 通配形式）",
+                f"{loc_base}.content_range",
+                block_index=block.index,
+                code="invalid_content_range",
+            )
+        cr_start, cr_end, cr_total = (
+            int(cr_match.group(1)),
+            int(cr_match.group(2)),
+            int(cr_match.group(3)),
+        )
+        if cr_end < cr_start:
+            raise BatchVerifyError(
+                "Content-Range 闭区间非法：last-byte-pos 不得小于 "
+                "first-byte-pos",
+                f"{loc_base}.content_range",
+                block_index=block.index,
+                code="invalid_content_range",
+            )
+        if cr_total != req.object_length:
+            raise BatchVerifyError(
+                f"Content-Range 声明的对象总长度 {cr_total} 与请求的 "
+                f"{req.object_length} 不一致",
+                f"{loc_base}.content_range",
+                block_index=block.index,
+                code="content_range_total_mismatch",
+            )
+        if (cr_start, cr_end) != (block.start, block.end):
+            raise BatchVerifyError(
+                f"Content-Range 闭区间 [{cr_start},{cr_end}] 与规划块 "
+                f"[{block.start},{block.end}] 不一致",
+                f"{loc_base}.content_range",
+                block_index=block.index,
+                code="content_range_mismatch",
+            )
+
+        # 2c. 响应体必须为合法标准 Base64，解码字节数严格等于块长度
+        #     （即 Content-Range 声明长度，二者已在上面证明相等）。
+        data = _decode_b64_batch(
+            item.body_b64, f"{loc_base}.body_b64", block.index
+        )
+        if len(data) != block.length:
+            raise BatchVerifyError(
+                f"回源块 {block.index} 响应体解码后 {len(data)} 字节，"
+                f"与规划长度 {block.length}（Content-Range 闭区间 "
+                f"[{block.start},{block.end}]）不符",
+                f"{loc_base}.body_b64",
+                block_index=block.index,
+                code="body_length_mismatch",
+            )
+
+        # 2d. 每块必须携带强 ETag，且全批逐字节相同（不同版本不得混入）。
+        strong_etag = _parse_strong_etag(
+            item.etag, f"{loc_base}.etag", block_index=block.index
+        )
+        if confirmed_etag is None:
+            confirmed_etag = strong_etag
+        elif strong_etag != confirmed_etag:
+            raise BatchVerifyError(
+                f"回源块 {block.index} 的 ETag 与此前已确认块的强 ETag "
+                "不一致：不同对象版本的分块不得混合重组",
+                f"{loc_base}.etag",
+                block_index=block.index,
+                code="etag_mismatch",
+            )
+
+        items_by_index[item.block_index] = item
+
+    # 3. expected_etag 与全批确认到的强 ETag 必须全等。
+    if expected_etag is not None and confirmed_etag != expected_etag:
+        if confirmed_etag is None:
+            raise BatchVerifyError(
+                "没有任何回源块（blocks/responses 为空），无法确认 expected_etag",
+                "expected_etag",
+                code="expected_etag_unverifiable",
+            )
+        raise BatchVerifyError(
+            "本批回源块确认到的强 ETag 与 expected_etag 不一致："
+            "对象版本已变化，不得按旧规划重组",
+            "expected_etag",
+            block_index=next(iter(items_by_index)),
+            code="expected_etag_mismatch",
+        )
+
+    # 4. 存在性核对：每个规划块都必须恰好有一份响应（缺块拒绝）。
+    missing = sorted(set(declared) - set(items_by_index))
+    if missing:
+        raise BatchVerifyError(
+            f"缺少 {len(missing)} 个回源块的上游响应：{missing}",
+            "responses",
+            block_index=missing[0],
+            code="missing_blocks",
+            extra={"missing": missing},
+        )
+
+    # 5. 全部通过：按块编号升序输出，body_b64 已在上文通过严格解码校验，
+    #    可原样作为 /assemble 的 contents 元素提交。
+    contents = [
+        VerifiedBlockContent(
+            block_index=idx, data_b64=items_by_index[idx].body_b64
+        )
+        for idx in sorted(items_by_index)
+    ]
+    return VerifyFetchBatchResponse(
+        object_length=req.object_length,
+        contents=contents,
+        etag=confirmed_etag,
+    )
 
 
 # --------------------------- /multipart-parse ---------------------------

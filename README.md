@@ -9,6 +9,13 @@
 - `POST /assemble`：回显 `/plan` 的 `blocks`、`mappings`（以及 `cached_blocks`），
   并分别按块提供 Base64 回源内容与缓存内容；服务严格校验来源 id、边界、缺块
   与重复块后，依据切片映射按原 ranges 顺序重组，返回每段范围的 Base64 内容与长度。
+- `POST /verify-fetch-batch`：校验按 `/plan` 的 `blocks` 逐块回源得到的上游
+  `206` 响应。接收 `blocks`、`object_length` 与按块编号提供的上游状态码、
+  `Content-Range`、ETag、Base64 响应体；只接受闭区间与规划块及对象总长完全
+  一致、响应体字节数严格相符的 206，缺块、重复块、多余块一律拒绝。所有块必须
+  携带**同一个强 ETag**（拒绝弱标签），可选的 `expected_etag` 还必须与之全等，
+  防止不同版本的分块混入。通过后按块编号返回可直接用于 `/assemble.contents`
+  的数据与确认的 ETag；校验失败返回带块编号与原因的 `422`，且不回显响应体。
 - `POST /multipart-parse`：解析上游对多区间 Range 请求返回的
   `multipart/byteranges` **完整响应体**（Base64 传输）。严格按 CRLF 切分每个
   part，校验 `Content-Range` 闭区间、part 字节长度、对象总长度/边界、
@@ -28,21 +35,24 @@
 
 ## Docker 一键启动
 
-需要 Docker 20.10+（支持 Compose v2）。在仓库根目录执行：
+需要 Docker 20.10+（支持 Compose v2）。**单条命令**即可构建并后台启动：
 
 ```
 docker compose up --build -d
 ```
 
-首次会构建镜像（Python 3.12 slim）并在后台启动；查看日志与停止：
+- 访问地址：http://127.0.0.1:8080 （仅绑定本机回环地址）
+- 接口文档（Swagger UI）：http://127.0.0.1:8080/docs
+- 健康检查：`curl http://127.0.0.1:8080/healthz` → `{"status":"ok"}`
+
+查看日志与停止：
 
 ```
 docker compose logs -f
 docker compose down
 ```
 
-不带 `-d` 可在前台运行。健康检查就绪后，服务监听
-http://127.0.0.1:8080 （接口文档：http://127.0.0.1:8080/docs ）。
+不带 `-d` 可在前台运行。
 
 不使用 Compose 时也可以直接用 Docker：
 
@@ -252,6 +262,134 @@ docker run --rm -p 127.0.0.1:8080:8080 \
 `cached_blocks` 的字节并做 Base64 编码；最后连同 `blocks`、`mappings`、
 `cached_blocks` 一起提交给 `/assemble`，即可取回与原请求 ranges 一一对应
 的字节内容。
+
+### `POST /verify-fetch-batch`
+
+在真正组装之前，用本端点对 `/plan` 规划的逐块回源结果做一次**严格的上游
+响应验收**：确认每块都是 HTTP `206 Partial Content`、`Content-Range` 与
+规划闭区间及对象总长一致、响应体字节数精确相符，并通过**强 ETag** 确认
+所有分块来自同一个对象版本。
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `object_length` | 对象总字节长度（回显 `/plan` 的同名值） |
+| `blocks` | 回显 `/plan` 返回的 `blocks`（全部命中缓存时为 `[]`） |
+| `responses` | 按块提供的上游响应要素列表，每项见下表 |
+| `expected_etag` | 可选；调用方此前确认过的强 ETag，提供时全批块必须与之全等 |
+
+`responses[]` 每项：
+
+| 字段 | 说明 |
+| --- | --- |
+| `block_index` | 回源块编号，对应 `blocks[].index` |
+| `status_code` | 上游 HTTP 状态码，**只有 206 可通过**（200/416 等一律拒绝） |
+| `content_range` | 上游 `Content-Range` 头原值，必须严格形如 `bytes start-end/total`（不接受 `*`） |
+| `etag` | 上游 `ETag` 头原值；必须存在且为**强 ETag**（不得以 `W/` 开头） |
+| `body_b64` | 该块上游响应体的标准 Base64（含正确 `=` 填充） |
+
+请求示例（沿用 `/assemble` 一节的三个块）：
+
+```json
+{
+  "object_length": 256,
+  "blocks": [
+    {"index": 0, "start": 0, "end": 39, "length": 40, "range_header": "bytes=0-39"},
+    {"index": 1, "start": 60, "end": 99, "length": 40, "range_header": "bytes=60-99"},
+    {"index": 2, "start": 240, "end": 255, "length": 16, "range_header": "bytes=240-255"}
+  ],
+  "expected_etag": "\"v3-strong\"",
+  "responses": [
+    {"block_index": 0, "status_code": 206,
+     "content_range": "bytes 0-39/256", "etag": "\"v3-strong\"",
+     "body_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJw=="},
+    {"block_index": 1, "status_code": 206,
+     "content_range": "bytes 60-99/256", "etag": "\"v3-strong\"",
+     "body_b64": "PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw=="},
+    {"block_index": 2, "status_code": 206,
+     "content_range": "bytes 240-255/256", "etag": "\"v3-strong\"",
+     "body_b64": "8PHy8/T19vf4+fr7/P3+/w=="}
+  ]
+}
+```
+
+校验通过时返回的 `contents` 元素与 `/assemble` 的 `contents` 元素结构完全
+相同，且已按 `block_index` 升序排列——**可原样放入 `/assemble` 请求体**；
+`etag` 为全批确认一致的强 ETag（去首尾空白后的原值，含引号）：
+
+```json
+{
+  "object_length": 256,
+  "contents": [
+    {"block_index": 0, "data_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJw=="},
+    {"block_index": 1, "data_b64": "PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiYw=="},
+    {"block_index": 2, "data_b64": "8PHy8/T19vf4+fr7/P3+/w=="}
+  ],
+  "etag": "\"v3-strong\""
+}
+```
+
+`blocks` 为空（全部命中缓存、无需回源）时，`responses` 也传空列表，服务返回
+`contents: []` 与 `etag: null`；此场景下不得传 `expected_etag`（没有任何
+响应可供确认，返回 `422`）。
+
+#### 严格校验规则
+
+按以下顺序执行（任一不满足立即返回 `422`，不回显任何响应体字节或 Base64）：
+
+1. `expected_etag`（若提供）自身必须是强 ETag：双引号包裹的 opaque-tag，
+   不得以 `W/`/`w/` 开头，不得含空格、控制字符或裸引号；
+2. 回显的 `blocks` 自身合法：编号非负且唯一、`start <= end`、
+   `length == end - start + 1`、`end < object_length`；
+3. 每个 `responses[]` 元素：
+   - `block_index` 非负、在 `responses` 中不重复，且必须存在于 `blocks`
+     （多余块 `unexpected_block`、重复块 `duplicate_response`）；
+   - `status_code == 206`，否则 `non_206_status`——防止上游把整对象 `200`
+     或错误页（`416`/`5xx` 等）当作分块内容混入；
+   - `content_range` 严格匹配 `bytes <start>-<end>/<total>`（RFC 7233
+     数字形式，拒绝 `*`、单位非 `bytes`、反转区间与夹带换行的头部注入）；
+     `<total>` 必须等于 `object_length`，闭区间必须与规划块**逐端点相等**；
+   - `body_b64` 为合法标准 Base64（`validate=True`，拒绝 URL-safe 字母表
+     与夹杂空白），解码后字节数必须恰好等于块长度（即 `end - start + 1`）；
+   - `etag` 必须存在且为强 ETag；全批所有块的 ETag 去除首尾 OWS 后必须
+     **逐字节相同**，不同版本的分块不得混合重组；
+4. 提供了 `expected_etag` 时，其与全批确认到的 ETag 必须全等；
+5. 存在性核对：`blocks` 中每个编号都必须恰好出现一次响应，缺块统一报
+   `missing_blocks`（响应附全部缺失编号 `missing: [...]`）。
+
+主要错误码（错误体统一为
+`{"error": "<code>", "detail": [{"message": ..., "loc": ..., "block_index": ...}]}`，
+定位形如 `responses[2].content_range`）：
+
+| error | 含义 |
+| --- | --- |
+| `non_206_status` | 上游状态码不是 206 |
+| `invalid_content_range` | Content-Range 语法非法（含 `*`、反转区间、非 bytes 单位等） |
+| `content_range_total_mismatch` | Content-Range 的 total 与对象总长不符 |
+| `content_range_mismatch` | Content-Range 闭区间与规划块不一致 |
+| `invalid_base64` | 响应体 Base64 非法或填充错误 |
+| `body_length_mismatch` | 响应体解码字节数与块声明长度不符 |
+| `missing_etag` | 响应缺少 ETag 头（或为空） |
+| `weak_etag` | 响应携带弱 ETag（W/ 前缀） |
+| `invalid_etag` | ETag 不是合法的强 opaque-tag |
+| `etag_mismatch` | 块间强 ETag 不一致（不同对象版本混入） |
+| `weak_expected_etag` | expected_etag 自身是弱标签 |
+| `invalid_expected_etag` | expected_etag 语法非法 |
+| `expected_etag_mismatch` | 批次 ETag 与 expected_etag 不一致（版本已变化） |
+| `expected_etag_unverifiable` | blocks/responses 为空时无法确认 expected_etag |
+| `missing_blocks` | 缺少规划块的上游响应（附 `missing` 编号列表） |
+| `duplicate_response` | 同一块的上游响应被重复提供 |
+| `unexpected_block` | 提供了 blocks 中不存在的多余块响应 |
+| `duplicate_block` / `invalid_block` / `invalid_block_length` / `block_out_of_bounds` / `invalid_block_index` | 回显的 blocks 自身非法 |
+
+仅依赖标准库的完整示例（/plan → 模拟上游 206 → /verify-fetch-batch →
+/assemble 逐字节核对）见
+[`examples/verify_fetch_batch_example.py`](examples/verify_fetch_batch_example.py)：
+
+```
+python examples/verify_fetch_batch_example.py
+```
 
 ### `POST /multipart-parse`
 
@@ -580,7 +718,12 @@ quoted-string、disposition type 缺失等）返回
 - `/assemble` 组装错误：`{"error": "<code>", "detail": [{"message": ..., "loc": ...}]}`，
   其中 `loc` 指向出错的字段路径（如 `contents[2].data_b64`、
   `mappings[0].slices[1]`），并按需附带 `block_index` / `cache_id` /
-  `range_index` / `slice_index`。主要错误码：
+  `range_index` / `slice_index`；
+- `/verify-fetch-batch` 回源验收错误采用同一结构：`detail[0]` 携带
+  `loc`（如 `responses[1].content_range`）与可归属的 `block_index`，
+  `missing_blocks` 另附 `missing` 编号列表；错误响应**绝不回显响应体**或
+  任何一方 ETag 的具体取值，错误码与含义见
+  [`POST /verify-fetch-batch`](#post-verify-fetch-batch) 一节；主要错误码：
 
   | error                       | 含义                               |
   | --------------------------- | ---------------------------------- |
